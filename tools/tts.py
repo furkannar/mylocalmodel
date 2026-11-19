@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import io
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 from urllib.request import urlretrieve
@@ -85,27 +86,51 @@ def list_voices() -> list[dict]:
 
 def _download_with_progress(url: str, dest: Path, label: str) -> None:
     """Download url to dest, printing a simple progress indicator."""
+    """Download url to dest via a .part file, so an interrupted download is never mistaken for a complete one."""
     dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_name(dest.name + ".part")
     print(f"[TTS] Downloading {label}…")
+    last_reported = [-10]
 
     def _reporthook(block: int, block_size: int, total: int) -> None:
+        # Report in 10% steps on separate lines: other models may be downloading
+        # at the same time, so carriage-return progress would garble the output.
         if total > 0:
             pct = min(100, block * block_size * 100 // total)
-            print(f"\r[TTS]   {label}: {pct}%", end="", flush=True)
+            if pct >= last_reported[0] + 10:
+                last_reported[0] = pct - pct % 10
+                print(f"[TTS]   {label}: {last_reported[0]}%", flush=True)
 
-    urlretrieve(url, dest, reporthook=_reporthook)
-    print(f"\r[TTS]   {label}: done ({dest.stat().st_size // 1024} KB)")
+    try:
+        urlretrieve(url, partial, reporthook=_reporthook)
+        partial.replace(dest)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    print(f"[TTS]   {label}: done ({dest.stat().st_size // 1024} KB)")
+
+
+def missing_model_files() -> list[tuple[str, Path]]:
+    """Return (label, path) for each Kokoro file not yet in tts_cache/."""
+    return [(path.name, path) for path in (_MODEL_PATH, _VOICES_PATH) if not path.exists()]
 
 
 def ensure_model_files() -> tuple[Path, Path]:
     """
     Download model + voices files to tts_cache/ if not already present.
-    Returns (model_path, voices_path).
+    Missing files are downloaded in parallel. Returns (model_path, voices_path).
     """
-    if not _MODEL_PATH.exists():
-        _download_with_progress(_MODEL_URL, _MODEL_PATH, "kokoro-v1.0.onnx")
-    if not _VOICES_PATH.exists():
-        _download_with_progress(_VOICES_URL, _VOICES_PATH, "voices-v1.0.bin")
+    downloads = [
+        (url, path) for url, path in ((_MODEL_URL, _MODEL_PATH), (_VOICES_URL, _VOICES_PATH))
+        if not path.exists()
+    ]
+    if len(downloads) == 1:
+        _download_with_progress(downloads[0][0], downloads[0][1], downloads[0][1].name)
+    elif downloads:
+        with ThreadPoolExecutor(max_workers=len(downloads), thread_name_prefix="tts-download") as pool:
+            futures = [pool.submit(_download_with_progress, url, path, path.name) for url, path in downloads]
+            for future in futures:
+                future.result()
     return _MODEL_PATH, _VOICES_PATH
 
 # ---------------------------------------------------------------------------
@@ -191,6 +216,16 @@ def get_tts() -> KokoroTTS:
         if _tts_instance is None:
             _tts_instance = KokoroTTS()
     return _tts_instance
+
+
+def warm_up() -> bool:
+    """Download (if needed) and load Kokoro ahead of the first request. Returns success."""
+    try:
+        get_tts()._get_kokoro()
+        return True
+    except Exception as exc:
+        print(f"[TTS] Warning: could not prepare TTS ({exc}); it will retry on first use.")
+        return False
 
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,8 @@
-"""Tools available to the local chat application."""
+"""Tools available to the local chat application.
 
-from tools.calculator import calculate
-from tools.rag import MiniWikiRAG, get_rag, query_rag, rag_retrieve
-from tools.tts import KokoroTTS, get_tts, list_voices
-
-__all__ = [
-    "calculate",
-    "MiniWikiRAG", "get_rag", "query_rag", "rag_retrieve",
-    "KokoroTTS", "get_tts", "list_voices",
-]
-
+Submodules are imported explicitly (``from tools.calculator import calculate``).
+This package deliberately imports nothing eagerly: the calculator worker
+subprocess imports ``tools.calculator``, and pulling in ``tools.rag`` or
+``tools.tts`` here would load torch, sentence-transformers and kokoro in that
+subprocess too, adding ~10 s of startup to every calculator call.
+"""

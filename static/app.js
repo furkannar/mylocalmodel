@@ -2,7 +2,7 @@ let currentConversationId = null;
 let isWorking = false;
 
 // TTS state
-let activeTTSSource = null;   // currently playing EventSource (null when idle)
+let activeTTSSource = null;   // AbortController of the current TTS stream (null when idle)
 let activeAudioCtx = null;    // Web AudioContext for the active playback session
 let ttsNextStartTime = 0;     // scheduled start time for the next audio chunk
 
@@ -298,7 +298,7 @@ function renderAssistantShell(assistantId) {
 
 function stopTTS() {
     if (activeTTSSource) {
-        activeTTSSource.close();
+        activeTTSSource.abort();
         activeTTSSource = null;
     }
     if (activeAudioCtx) {
@@ -351,16 +351,17 @@ function attachSpeakerButton(assistantId, getText) {
             activeAudioCtx = ctx;
             ttsNextStartTime = ctx.currentTime;
 
-            const url = `/tts/stream?text=${encodeURIComponent(text)}&voice=${encodeURIComponent(voice)}`;
-            const eventSource = new EventSource(url);
-            activeTTSSource = eventSource;
+            // POST keeps long answers out of the URL (EventSource only supports GET),
+            // so the SSE stream is read manually from the fetch response body.
+            const abortController = new AbortController();
+            activeTTSSource = abortController;
             let firstChunk = true;
 
-            eventSource.onmessage = async (e) => {
-                if (!e.data) return;
+            const playChunk = async (data) => {
+                if (!data) return;
                 try {
                     // Decode base64 WAV blob sent per sentence chunk.
-                    const binary = atob(e.data);
+                    const binary = atob(data);
                     const bytes = new Uint8Array(binary.length);
                     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
@@ -384,24 +385,55 @@ function attachSpeakerButton(assistantId, getText) {
                 }
             };
 
-            eventSource.addEventListener('done', () => {
-                eventSource.close();
-                activeTTSSource = null;
-                // Reset button after the last chunk finishes playing.
-                const delay = Math.max(0, (ttsNextStartTime - ctx.currentTime) * 1000 + 200);
-                setTimeout(() => {
-                    btn.textContent = '🔊';
-                    btn.classList.remove('playing');
-                    btn.title = 'Read aloud';
-                }, delay);
+            const response = await fetch('/tts/stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text, voice }),
+                signal: abortController.signal,
             });
+            if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
 
-            eventSource.addEventListener('error', () => {
-                stopTTS();
-            });
+            // Parse SSE events ("event: x\ndata: y\n\n"). Chunks are decoded one at a
+            // time so they are always scheduled in order.
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let finished = false;
+            while (!finished) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                let boundary;
+                while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+                    const rawEvent = buffer.slice(0, boundary);
+                    buffer = buffer.slice(boundary + 2);
+                    let eventName = 'message';
+                    const dataLines = [];
+                    for (const line of rawEvent.split('\n')) {
+                        if (line.startsWith('event:')) eventName = line.slice(6).trim();
+                        else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+                    }
+                    const data = dataLines.join('\n');
+                    if (eventName === 'message') await playChunk(data);
+                    else if (eventName === 'error') console.warn('[TTS] Server error:', data);
+                    else if (eventName === 'done') finished = true;
+                }
+            }
+
+            if (activeTTSSource !== abortController) return; // stopped or replaced meanwhile
+            activeTTSSource = null;
+            // Reset button after the last chunk finishes playing.
+            const delay = Math.max(0, (ttsNextStartTime - ctx.currentTime) * 1000 + 200);
+            setTimeout(() => {
+                btn.textContent = '🔊';
+                btn.classList.remove('playing');
+                btn.title = 'Read aloud';
+            }, delay);
         } catch (err) {
-            console.error('[TTS] Playback error:', err);
-            stopTTS();
+            if (err.name !== 'AbortError') {
+                console.error('[TTS] Playback error:', err);
+                stopTTS();
+            }
         }
     });
 

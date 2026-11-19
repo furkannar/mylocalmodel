@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+calculator_calls.jsonl
+conversation_history.json
+conversation_history.json.tmp
+tools/rag_cache/
+tools/tts_cache/

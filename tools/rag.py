@@ -1,8 +1,10 @@
 """
-RAG (Retrieval-Augmented Generation) tool using rag-datasets/rag-mini-wikipedia.
+RAG (Retrieval-Augmented Generation) tool over Wikipedia-grounded QA pairs.
 
-Uses:
-- Dataset: rag-datasets/rag-mini-wikipedia ("question-answer" split via Hugging Face datasets)
+Uses (all configurable in config.RAGConfig):
+- Dataset: FreedomIntelligence/RAG-Instruct, first `max_rows` rows of the "train" split
+  (columns: question, answer, documents). Question + answer pairs are indexed; the
+  `documents` passages are not stored, to keep the index small.
 - Embedding model: sentence-transformers/all-MiniLM-L6-v2 on Hugging Face
 - Metric: Cosine distance (1 - cosine_similarity), with maximum distance <= 0.75
 """
@@ -19,28 +21,22 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 try:
-    from config import (
-        DATASET_CONFIG,
-        DATASET_NAME,
-        DEFAULT_CACHE_DIR,
-        EMBEDDING_MODEL_NAME,
-        MAX_COSINE_DISTANCE,
-        RAGConfig,
-    )
+    from config import RAGConfig
 except ImportError:
-    from mylocalmodel.config import (
-        DATASET_CONFIG,
-        DATASET_NAME,
-        DEFAULT_CACHE_DIR,
-        EMBEDDING_MODEL_NAME,
-        MAX_COSINE_DISTANCE,
-        RAGConfig,
-    )
+    from mylocalmodel.config import RAGConfig
+
+MAX_COSINE_DISTANCE = RAGConfig().max_cosine_distance
+CACHE_FORMAT_VERSION = 2
+INDEX_FILENAME = "rag_qa_index.pt"
+
+
+class RAGRowCountError(RuntimeError):
+    """The dataset did not yield exactly `max_rows` rows. Fatal: the app must not start."""
 
 
 class MiniWikiRAG:
     """
-    RAG retriever over rag-datasets/rag-mini-wikipedia ('question-answer' split)
+    RAG retriever over the configured QA dataset (default: FreedomIntelligence/RAG-Instruct)
     using sentence-transformers/all-MiniLM-L6-v2 embeddings and cosine distance filtering.
     """
 
@@ -98,36 +94,103 @@ class MiniWikiRAG:
 
         return torch.cat(batch_embeddings, dim=0).to(self.device)
 
+    def _open_stream(self):
+        """
+        Open the split as a stream (nothing is written to disk).
+
+        Preferred source: the Hub's automatic Parquet export (revision
+        refs/convert/parquet). Parquet is stored in row groups of ~1K rows, so a
+        stream of the first max_rows rows only fetches the first row groups, and
+        reading just the question/answer columns skips the large `documents`
+        column. For RAG-Instruct, 12K rows is ~12 of 41 row groups instead of the
+        296 MB JSON file. If the export is unavailable, fall back to streaming the
+        original files (a single JSON file is still transferred in full, but is
+        not stored on disk).
+        """
+        try:
+            return load_dataset(
+                self.config.dataset_name,
+                self.config.dataset_config,
+                split=self.config.dataset_split,
+                revision="refs/convert/parquet",
+                streaming=True,
+                columns=["question", "answer"],
+            ), "Parquet export (question/answer columns only)"
+        except Exception as exc:
+            print(f"Parquet export not available ({exc}); streaming the original files instead.")
+            return load_dataset(
+                self.config.dataset_name,
+                self.config.dataset_config,
+                split=self.config.dataset_split,
+                streaming=True,
+            ), "original files"
+
     def _load_raw_data(self) -> List[Dict[str, Any]]:
         """
-        Load records from the 'question-answer' split of rag-datasets/rag-mini-wikipedia
-        using the native Hugging Face datasets library.
+        Stream the first `max_rows` rows of the configured split, the streaming
+        equivalent of load_dataset(name, split="train[:max_rows]"), without
+        downloading the whole dataset.
+
+        Raises RuntimeError if the number of loaded rows differs from `max_rows`
+        (for example when max_rows exceeds the rows the split actually has).
         """
-        print(f"Loading {self.config.dataset_name} ({self.config.dataset_config}) via HF datasets...")
-        ds = load_dataset(self.config.dataset_name, self.config.dataset_config)
-        split_data = ds.get("test") or ds.get("train") or ds[list(ds.keys())[0]]
+        max_rows = self.config.max_rows
+        if max_rows <= 0:
+            raise RAGRowCountError(f"RAG max_rows must be positive, got {max_rows}.")
+        stream, source = self._open_stream()
+        print(
+            f"Streaming the first {max_rows} rows of {self.config.dataset_name} "
+            f"(split '{self.config.dataset_split}', {source})..."
+        )
+        rows = list(tqdm(stream.take(max_rows), total=max_rows, desc="Streaming rows"))
+
+        loaded_rows = len(rows)
+        print(f"Loaded {loaded_rows} rows from {self.config.dataset_name} (requested {max_rows}).")
+        if loaded_rows != max_rows:
+            raise RAGRowCountError(
+                f"Expected {max_rows} rows from {self.config.dataset_name} split "
+                f"'{self.config.dataset_split}', but loaded {loaded_rows}."
+            )
 
         records = []
-        for row in split_data:
-            records.append({
-                "id": row.get("id"),
-                "question": str(row.get("question", "")).strip(),
-                "answer": str(row.get("answer", "")).strip(),
-            })
-        print(f"Loaded {len(records)} QA pairs from {self.config.dataset_name}.")
+        for index, row in enumerate(rows):
+            question = str(row.get("question") or "").strip()
+            answer = str(row.get("answer") or "").strip()
+            if question and answer:
+                records.append({"id": row.get("id", index), "question": question, "answer": answer})
+        skipped = loaded_rows - len(records)
+        if skipped:
+            print(f"Skipped {skipped} row(s) with an empty question or answer.")
+        print(f"Indexing {len(records)} QA pairs.")
         return records
 
     def _build_or_load_index(self) -> None:
         """
         Load cached index if available; otherwise compute embeddings and persist to disk.
         """
-        cache_file = self.cache_dir / "rag_mini_wiki_qa_index.pt"
+        cache_file = self.cache_dir / INDEX_FILENAME
+        expected = {
+            "format_version": CACHE_FORMAT_VERSION,
+            "dataset": self.config.dataset_name,
+            "config": self.config.dataset_config,
+            "split": self.config.dataset_split,
+            "max_rows": self.config.max_rows,
+            "model": self.config.embedding_model_name,
+        }
         if cache_file.exists():
-            data = torch.load(cache_file, map_location=self.device)
-            self.embeddings = data["embeddings"].to(self.device)
-            self.records = data["records"]
-            print(f"Loaded {len(self.records)} indexed entries from cache: {cache_file}")
-            return
+            try:
+                # weights_only=True: the cache holds only tensors, lists, dicts and strings,
+                # so refuse anything that would need arbitrary unpickling.
+                data = torch.load(cache_file, map_location=self.device, weights_only=True)
+                stale = {key: data.get(key) for key in expected if data.get(key) != expected[key]}
+            except Exception as exc:
+                data, stale = None, {"error": str(exc)}
+            if data is not None and not stale:
+                self.embeddings = data["embeddings"].to(self.device)
+                self.records = data["records"]
+                print(f"Loaded {len(self.records)} indexed entries from cache: {cache_file}")
+                return
+            print(f"RAG cache does not match current settings ({stale}); rebuilding index...")
 
         self.records = self._load_raw_data()
         texts_to_embed = [
@@ -140,9 +203,7 @@ class MiniWikiRAG:
             {
                 "embeddings": self.embeddings.cpu(),
                 "records": self.records,
-                "dataset": self.config.dataset_name,
-                "config": self.config.dataset_config,
-                "model": self.config.embedding_model_name,
+                **expected,
             },
             cache_file,
         )
@@ -201,19 +262,24 @@ class MiniWikiRAG:
             })
         return results
 
-    @staticmethod
-    def format_context(matches: List[Dict[str, Any]]) -> str:
+    def format_context(self, matches: List[Dict[str, Any]]) -> str:
         """
-        Format retrieved QA matches into a clean prompt context block.
+        Format retrieved QA matches into a prompt context block. Each answer is cut to
+        `max_context_chars` (at a word boundary) so a few long answers cannot crowd out
+        the conversation history.
         """
         if not matches:
             return "No relevant Wikipedia QA context found within distance threshold."
 
+        limit = self.config.max_context_chars
         lines = ["[Wikipedia QA Reference Context]:"]
         for i, match in enumerate(matches, 1):
+            answer = match["answer"]
+            if limit and len(answer) > limit:
+                answer = answer[:limit].rsplit(" ", 1)[0] + " …"
             lines.append(
                 f"{i}. Question: {match['question']}\n"
-                f"   Answer: {match['answer']}\n"
+                f"   Answer: {answer}\n"
                 f"   (Cosine Distance: {match['distance']:.4f}, Similarity: {match['similarity']:.4f})"
             )
         return "\n".join(lines)
