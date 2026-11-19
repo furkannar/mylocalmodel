@@ -1,56 +1,71 @@
 r"""
-Simple Temperature Scaling for GPT-2 Instruct Model
+Temperature scaling and Best-of-N candidate scoring for the Qwen chat model.
 
-This module provides simple temperature scaling for calibrating
-model confidence in text generation and Best-of-N candidate scoring.
+Key equations:
+- Temperature scaling: $\text{softmax}(z_i / T) = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}$
+  - Higher T (>1) softens probabilities; lower T (<1) sharpens them.
 
-Key Equations:
-- Temperature Scaling: $\text{softmax}(z_i / T) = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}$
-  - Higher T (>1) softens probabilities (more uniform, higher uncertainty)
-  - Lower T (<1) sharpens probabilities (more peaked, higher confidence)
+- Length-normalized log-likelihood score (Best-of-N):
+  $s(x, y) = \frac{1}{|M|} \sum_{t \in M} \log p(y_t | x, y_{<t}; T_{\text{calib}})$
+  where $M$ is the set of generated positions that are not padding. This is the log of
+  the geometric mean token probability, so it does not favour short responses.
 
-- Length-Normalized Log-Likelihood Score (Best-of-N):
-  $s(x, y) = \frac{1}{|y|} \sum_{t=1}^{|y|} \log p_\theta(y_t | x, y_{<t}; T_{\text{calib}})$
-  - Computes log of geometric mean of token probabilities
-  - Normalizes by sequence length |y| to eliminate short-response bias
+The per-token log-probabilities are recorded during generation by
+``TokenLogProbRecorder`` (one vocabulary row per step) instead of keeping the full
+``[N, steps, vocab]`` score tensor in GPU memory.
 """
+
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
-from typing import Dict
+from transformers import LogitsProcessor
+
 from config import ChatConfig
 
 
 class SimpleTemperatureScaler:
-    """
-    Simple temperature scaling for confidence calibration and candidate scoring.
-
-    Temperature is a configurable parameter that scales the logits
-    before applying softmax to adjust the confidence distribution.
-    """
+    """Temperature scaling for candidate scoring."""
 
     def __init__(self, config: ChatConfig):
-        """
-        Initialize temperature scaler from config.
-
-        Args:
-            config: ChatConfig containing calibration_temperature
-        """
         self.temperature = config.calibration_temperature
 
     def scale_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        r"""
-        Apply temperature scaling to logits.
+        r"""Return $\text{logits} / T_{\text{calib}}$."""
+        return logits / self.temperature
 
-        Equation: $\text{scaled\_logits} = \frac{\text{logits}}{T}$
+    def log_probs(self, logits: torch.Tensor) -> torch.Tensor:
+        """Log-softmax over the vocabulary after calibration scaling."""
+        return F.log_softmax(self.scale_logits(logits.float()), dim=-1)
+
+    @staticmethod
+    def score_token_log_probs(
+            token_log_probs: torch.Tensor,
+            generated_tokens: torch.Tensor,
+            pad_token_id: Optional[int],
+    ) -> Dict[str, float]:
+        """
+        Length-normalized score from per-token log-probabilities.
 
         Args:
-            logits: Raw model outputs [B, seq_len, V] or [seq_len, V]
-
-        Returns:
-            Scaled logits
+            token_log_probs: log p(y_t) for each generated position [seq_len]
+            generated_tokens: generated token IDs [seq_len]
+            pad_token_id: positions holding this ID are excluded from the score
         """
-        return logits / self.temperature
+        if pad_token_id is None:
+            valid_mask = torch.ones_like(generated_tokens, dtype=torch.bool)
+        else:
+            valid_mask = generated_tokens != pad_token_id
+        valid_len = int(valid_mask.sum().item())
+        if valid_len == 0:
+            return {'score': -float('inf'), 'geom_mean_prob': 0.0, 'token_count': 0}
+
+        score = token_log_probs[valid_mask].sum().item() / valid_len
+        return {
+            'score': score,
+            'geom_mean_prob': float(torch.exp(torch.tensor(score)).item()),
+            'token_count': valid_len,
+        }
 
     def score_candidate(
             self,
@@ -58,97 +73,42 @@ class SimpleTemperatureScaler:
             generated_tokens: torch.Tensor,
             pad_token_id: int
     ) -> Dict[str, float]:
-        r"""
-        Compute length-normalized log-likelihood score for a single candidate response:
-
-        $s(x, y) = \frac{1}{|y|} \sum_{t=1}^{|y|} \log p(y_t | x, y_{<t}; T_{\text{calib}})$
-
-        Args:
-            logits: Logit tensor for generated tokens [seq_len, vocab_size]
-            generated_tokens: Token IDs for generated sequence [seq_len]
-            pad_token_id: ID used for padding tokens
-
-        Returns:
-            Dictionary containing length-normalized score, geometric mean prob, and token count.
-        """
-        if generated_tokens.dim() == 1:
-            generated_tokens = generated_tokens.unsqueeze(0)
-        if logits.dim() == 2:
-            logits = logits.unsqueeze(0)
-
-        # Create valid mask (exclude pad tokens)
-        valid_mask = (generated_tokens != pad_token_id)
-        valid_len = valid_mask.sum().item()
-
-        if valid_len == 0:
-            return {'score': -float('inf'), 'geom_mean_prob': 0.0, 'token_count': 0}
-
-        # Apply temperature scaling
-        scaled_logits = self.scale_logits(logits)  # [1, seq_len, V]
-
-        # Log-softmax over vocabulary
-        log_probs = F.log_softmax(scaled_logits, dim=-1)  # [1, seq_len, V]
-
-        # Extract log_prob of actual generated tokens
-        seq_len = generated_tokens.shape[1]
-        token_log_probs = log_probs[0, torch.arange(seq_len), generated_tokens[0]]  # [seq_len]
-
-        # Mask pad tokens and average log-probabilities
-        valid_log_probs = token_log_probs[valid_mask[0]]
-        score = valid_log_probs.sum().item() / valid_len
-        geom_mean_prob = torch.exp(torch.tensor(score)).item()
-
-        return {
-            'score': score,
-            'geom_mean_prob': geom_mean_prob,
-            'token_count': valid_len
-        }
-
-    def compute_confidence_metrics(
-            self,
-            logits: torch.Tensor,
-            tokens: torch.Tensor
-    ) -> Dict[str, float]:
-        """
-        Compute simple confidence metrics from logits.
-
-        Args:
-            logits: Model logits [B, seq_len, V]
-            tokens: Generated token IDs [B, seq_len]
-
-        Returns:
-            Dictionary with confidence metrics
-        """
-        # Apply temperature scaling
-        scaled_logits = self.scale_logits(logits)
-
-        # Compute softmax probabilities
-        probs = F.softmax(scaled_logits, dim=-1)
-
-        # Max probability per position (confidence)
-        max_probs = torch.max(probs, dim=-1)[0]
-
-        # Probability of actual generated tokens
-        B, seq_len, V = probs.shape
-        token_probs = probs[torch.arange(B)[:, None],
-        torch.arange(seq_len)[None, :],
-        tokens]
-
-        # Aggregate metrics
-        metrics = {
-            'avg_max_prob': max_probs.mean().item(),
-            'avg_token_prob': token_probs.mean().item(),
-            'min_token_prob': token_probs.min().item(),
-            'temperature': self.temperature
-        }
-
-        return metrics
+        """Score a candidate from its full logits [seq_len, vocab_size] (kept for offline use)."""
+        log_probs = self.log_probs(logits)
+        positions = torch.arange(generated_tokens.shape[0], device=log_probs.device)
+        token_log_probs = log_probs[positions, generated_tokens]
+        return self.score_token_log_probs(token_log_probs, generated_tokens, pad_token_id)
 
     def set_temperature(self, temperature: float):
-        """
-        Update temperature parameter.
-
-        Args:
-            temperature: New temperature value
-        """
         self.temperature = temperature
+
+
+class TokenLogProbRecorder(LogitsProcessor):
+    """
+    Records the calibrated log-probability of each sampled token during ``generate``.
+
+    It must be the last logits processor so it sees the same scores the sampler uses
+    (after repetition penalty, temperature, top-k and top-p). At step t it receives
+    ``input_ids`` that end with the token sampled at step t-1, so it looks that token
+    up in the previous step's log-softmax row. Only one ``[batch, vocab]`` row is kept.
+    """
+
+    def __init__(self, scaler: SimpleTemperatureScaler):
+        self.scaler = scaler
+        self._previous: Optional[torch.Tensor] = None
+        self._steps = []
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        if self._previous is not None:
+            self._steps.append(self._previous.gather(1, input_ids[:, -1:]).squeeze(1))
+        self._previous = self.scaler.log_probs(scores)
+        return scores
+
+    def finish(self, sequences: torch.LongTensor) -> torch.Tensor:
+        """Return log-probabilities for every generated token, shape [batch, generated_len]."""
+        if self._previous is not None:
+            self._steps.append(self._previous.gather(1, sequences[:, -1:]).squeeze(1))
+            self._previous = None
+        if not self._steps:
+            return torch.empty(sequences.shape[0], 0, device=sequences.device)
+        return torch.stack(self._steps, dim=1)

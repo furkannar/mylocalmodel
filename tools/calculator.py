@@ -3,27 +3,33 @@
 from __future__ import annotations
 
 import ast
+import atexit
 import json
 import math
 import operator
+import queue
 import re
 import subprocess
 import sys
-import time
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 class CalculatorError(ValueError):
     """Raised when calculator input is invalid or cannot be evaluated."""
 
 
-TIMEOUT_SECONDS = 60.0
+TIMEOUT_SECONDS = 2.0  # compute time per expression; worker startup is not counted
+MAX_TIMEOUT_SECONDS = 60.0
+WORKER_STARTUP_TIMEOUT_SECONDS = 60.0
 MAX_EXPRESSION_LENGTH = 512
 MAX_AST_NODES = 100
 MAX_AST_DEPTH = 20
 MAX_POWER = 10_000
 MAX_OUTPUT_LENGTH = 2_000
+MAX_INTEGER_BITS = 100_000
+_SYMBOLIC_FUNCS = {"diff", "integrate", "limit"}
 
 _BINARY_OPERATORS = {
     ast.Add: operator.add,
@@ -66,6 +72,21 @@ def _sympy():
     return sp
 
 
+def _checked_power(base: Any, exponent: Any) -> Any:
+    """Raise base to exponent after rejecting results that would be enormous."""
+    if isinstance(exponent, bool) or not isinstance(exponent, (int, float)):
+        raise CalculatorError("Exponent must be a number.")
+    if abs(exponent) > MAX_POWER:
+        raise CalculatorError(f"Exponent magnitude must be at most {MAX_POWER}.")
+    if isinstance(base, int) and not isinstance(base, bool) and isinstance(exponent, int) and exponent > 0:
+        if abs(base) > 1 and (abs(base).bit_length() - 1) * exponent > MAX_INTEGER_BITS:
+            raise CalculatorError("Integer result is too large.")
+    try:
+        return base ** exponent
+    except OverflowError as exc:
+        raise CalculatorError("Result is too large.") from exc
+
+
 def _evaluate_node(node: ast.AST) -> Any:
     sp = _sympy()
     if isinstance(node, ast.Expression):
@@ -87,10 +108,9 @@ def _evaluate_node(node: ast.AST) -> Any:
     if isinstance(node, ast.BinOp) and type(node.op) in _BINARY_OPERATORS:
         left, right = _evaluate_node(node.left), _evaluate_node(node.right)
         if isinstance(node.op, ast.Pow):
-            if not isinstance(right, (int, float)) or abs(right) > MAX_POWER:
-                raise CalculatorError(f"Exponent magnitude must be at most {MAX_POWER}.")
+            return _checked_power(left, right)
         result = _BINARY_OPERATORS[type(node.op)](left, right)
-        if isinstance(result, int) and result.bit_length() > 100_000:
+        if isinstance(result, int) and result.bit_length() > MAX_INTEGER_BITS:
             raise CalculatorError("Integer result is too large.")
         return result
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords:
@@ -143,7 +163,7 @@ def _call_function(name: str, args: list[Any]) -> Any:
         return sp.N(args[0], precision)
 
     if any(getattr(arg, "free_symbols", set()) for arg in args):
-        funcs = {"sqrt": sp.sqrt, "log": sp.log, "pow": operator.pow,
+        funcs = {"sqrt": sp.sqrt, "log": sp.log, "pow": _checked_power,
                  "abs": sp.Abs, "sin": sp.sin, "cos": sp.cos, "tan": sp.tan,
                  "exp": sp.exp, "ceil": sp.ceiling, "floor": sp.floor}
         if name == "round":
@@ -156,7 +176,7 @@ def _call_function(name: str, args: list[Any]) -> Any:
     funcs = {
         "sqrt": lambda x: math.sqrt(x[0]),
         "log": lambda x: math.log(x[0], x[1]) if len(x) > 1 else math.log(x[0]),
-        "pow": lambda x: x[0] ** x[1],
+        "pow": lambda x: _checked_power(x[0], x[1]),
         "abs": lambda x: abs(x[0]),
         "sin": lambda x: math.sin(x[0]), "cos": lambda x: math.cos(x[0]),
         "tan": lambda x: math.tan(x[0]), "exp": lambda x: math.exp(x[0]),
@@ -166,13 +186,133 @@ def _call_function(name: str, args: list[Any]) -> Any:
     func = funcs.get(name)
     if func is None:
         raise CalculatorError(f"Function is not available: {name}")
+    if name == "pow" and len(args) != 2:
+        raise CalculatorError("pow takes exactly two arguments.")
     return func(args)
 
 
 def _evaluate_expression(expression: str) -> str:
     tree = ast.parse(expression, mode="eval")
     _check_tree(tree)
-    return str(_evaluate_node(tree))
+    result = _evaluate_node(tree)
+    uses_calculus = any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _SYMBOLIC_FUNCS
+        for node in ast.walk(tree)
+    )
+    free_symbols = getattr(result, "free_symbols", set())
+    if free_symbols and not uses_calculus:
+        names = ", ".join(sorted(str(symbol) for symbol in free_symbols))
+        raise CalculatorError(
+            f"Unknown name(s): {names}. The calculator evaluates numeric expressions; "
+            "variables are only allowed inside diff, integrate, or limit."
+        )
+    if isinstance(result, float) and math.isfinite(result):
+        return f"{result:.12g}"  # hide binary floating-point noise such as 64.80000000000001
+    return str(result)
+
+
+class _CalculatorWorker:
+    """One long-lived worker process, started once and reused for every call.
+
+    A fresh process cannot reuse modules the main app already loaded, so the
+    startup cost (Python + SymPy imports) is paid once here instead of per call.
+    If a calculation exceeds its time limit, the worker is killed and a
+    replacement starts warming up immediately.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._process: Optional[subprocess.Popen] = None
+        self._responses: "queue.Queue[Optional[dict]]" = queue.Queue()
+        self._ready = False
+
+    def _start(self) -> None:
+        self._responses = queue.Queue()
+        self._ready = False
+        self._process = subprocess.Popen(
+            [sys.executable, "-m", "tools.calculator_worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+            cwd=Path(__file__).resolve().parents[1],
+        )
+        threading.Thread(
+            target=self._read_responses, args=(self._process, self._responses), daemon=True
+        ).start()
+
+    @staticmethod
+    def _read_responses(process: subprocess.Popen, responses: "queue.Queue[Optional[dict]]") -> None:
+        for line in process.stdout:
+            try:
+                responses.put(json.loads(line))
+            except json.JSONDecodeError:
+                responses.put({"ok": False, "error": "Calculator worker returned an invalid response."})
+        responses.put(None)  # the process exited
+
+    def _stop(self) -> None:
+        if self._process is not None:
+            try:
+                self._process.kill()
+                self._process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        self._process = None
+        self._ready = False
+
+    def _ensure_ready(self) -> None:
+        if self._process is None or self._process.poll() is not None:
+            self._start()
+        if self._ready:
+            return
+        try:
+            message = self._responses.get(timeout=WORKER_STARTUP_TIMEOUT_SECONDS)
+        except queue.Empty:
+            self._stop()
+            raise CalculatorError("Calculator worker did not start in time.")
+        if not message or not message.get("ready"):
+            self._stop()
+            raise CalculatorError("Calculator worker failed to start.")
+        self._ready = True
+
+    def warm_up(self) -> None:
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                self._start()
+
+    def evaluate(self, expression: str, timeout: float) -> dict:
+        with self._lock:
+            self._ensure_ready()
+            try:
+                self._process.stdin.write(json.dumps({"expression": expression}) + "\n")
+                self._process.stdin.flush()
+            except OSError as exc:
+                self._stop()
+                raise CalculatorError("Calculator worker is not running.") from exc
+            try:
+                response = self._responses.get(timeout=timeout)
+            except queue.Empty:
+                self._stop()
+                self._start()
+                raise TimeoutError(f"Calculator exceeded its {timeout:.1f}s time limit.")
+            if response is None:
+                self._stop()
+                raise CalculatorError("Calculator worker stopped unexpectedly.")
+            return response
+
+    def close(self) -> None:
+        with self._lock:
+            self._stop()
+
+
+_worker = _CalculatorWorker()
+atexit.register(_worker.close)
+
+
+def warm_up() -> None:
+    """Start the calculator worker in the background so the first call is fast."""
+    _worker.warm_up()
 
 
 def calculate(expression: str, timeout: float = TIMEOUT_SECONDS) -> str:
@@ -183,31 +323,9 @@ def calculate(expression: str, timeout: float = TIMEOUT_SECONDS) -> str:
     ``integrate(sin(x), x)``, and ``limit(sin(x)/x, x, 0)``.
     """
     normalized = _normalize(expression)
-    if not 0 < timeout <= 60.0:
-        raise ValueError("Timeout must be greater than 0 and no more than 60 seconds.")
-
-    started = time.perf_counter()
-    try:
-        completed = subprocess.run(
-            [sys.executable, "-m", "tools.calculator_worker"],
-            input=json.dumps({"expression": normalized}),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=Path(__file__).resolve().parents[1],
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise TimeoutError(f"Calculator exceeded its {timeout:.1f}s time limit.") from exc
-    elapsed = time.perf_counter() - started
-    if elapsed > timeout:
-        raise TimeoutError(f"Calculator exceeded its {timeout:.1f}s time limit.")
-    if completed.returncode != 0:
-        raise CalculatorError("Calculator worker failed to run.")
-    try:
-        response = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise CalculatorError("Calculator worker returned an invalid response.") from exc
+    if not 0 < timeout <= MAX_TIMEOUT_SECONDS:
+        raise ValueError(f"Timeout must be greater than 0 and no more than {MAX_TIMEOUT_SECONDS:g} seconds.")
+    response = _worker.evaluate(normalized, timeout)
     if not response.get("ok"):
         raise CalculatorError(response.get("error", "Calculation failed."))
     result = response["result"]
