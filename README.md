@@ -387,6 +387,34 @@ This session was recorded with the previous RAG dataset (`rag-datasets/rag-mini-
 - EOS ends generation normally. Configured stop strings are a fallback: the decoded output is cut where one appears at the start of a line (for example a fake `User:` turn), so ordinary text such as "the user: …" is not truncated. Generation itself may continue beyond a stop string until EOS or the token limit.
 - The web server handles chat requests in a worker thread, so a long generation does not block TTS streaming or `/health`. Errors are returned as HTTP 500 with a `detail` message, and requests that arrive while the model is still loading get HTTP 503.
 
+## AI assistance disclosure
+
+Some commits in this repository carry a `Co-Authored-By: Claude …` line. This section explains what that means and what it does not.
+
+**Scope.** Claude (Anthropic's Claude Opus 5.5, used through the Claude Code CLI) helped with one round of changes, merged as PR #11 (commit `e4740c4`). The project's design and its earlier implementation (the Best-of-N sampler with calibrated scoring, the restricted calculator, RAG, Kokoro TTS, and the web UI) predate that work. See the Git history for details.
+
+**What the maintainer did.** The work was directed and reviewed by the maintainer, not generated unattended:
+
+- Asked for a review of the codebase and chose which findings to act on.
+- Found and reported the problems that drove the changes: the calculator timeouts, and calculator calls on non-math questions such as "GPT-3".
+- Made the design decisions:
+  - let the model decide when to use the calculator, instead of a keyword detector;
+  - load missing models concurrently;
+  - replace the RAG dataset with `FreedomIntelligence/RAG-Instruct`;
+  - cap it at 12,000 rows, with a hard error if the loaded row count differs;
+  - stream the dataset rather than download it.
+- Stopped runs that conflicted with local constraints (limited disk space).
+- Tested the result locally, then reviewed and merged the pull request.
+
+**What Claude did.** Within those decisions, Claude:
+
+- Analyzed the code and found the root causes. For example, the calculator subprocess re-imported torch and sentence-transformers on every call.
+- Wrote the implementation: the shared `engine.py`, the persistent calculator worker, memory-light scoring, parallel startup, streamed RAG loading, and the web fixes.
+- Ran the verification checks described in the PR, such as calculator timing and scoring equivalence on the GPU.
+- Updated this README.
+
+**Responsibility.** All AI-assisted changes were reviewed before merging, and the maintainer remains responsible for the code. Known limitations, including those of the AI-assisted parts (see the calculator's *Known limitation* note), are documented above rather than hidden.
+
 ## License
 
 This project is distributed under the MIT License. See `LICENSE` for details.
